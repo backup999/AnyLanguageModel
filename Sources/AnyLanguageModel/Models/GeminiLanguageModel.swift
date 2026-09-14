@@ -285,6 +285,7 @@ public struct GeminiLanguageModel: LanguageModel {
         // The entries this call adds, which is what the response reports. `transcript` keeps the
         // full conversation because each iteration rebuilds the request from it.
         var entries: [Transcript.Entry] = []
+        var usage = ReportedUsage()
 
         // Multi-turn conversation loop for tool calling
         while true {
@@ -305,6 +306,8 @@ public struct GeminiLanguageModel: LanguageModel {
                 headers: headers,
                 body: body
             )
+
+            usage.add(response.usageMetadata?.reportedUsage)
 
             guard let firstCandidate = response.candidates.first else {
                 throw GeminiError.noCandidate
@@ -329,7 +332,8 @@ public struct GeminiLanguageModel: LanguageModel {
                     return LanguageModelSession.Response(
                         content: empty.content,
                         rawContent: empty.rawContent,
-                        transcriptEntries: ArraySlice(entries)
+                        transcriptEntries: ArraySlice(entries),
+                        usage: usage.value
                     )
                 case .invocations(let invocations):
                     if !invocations.isEmpty {
@@ -364,6 +368,7 @@ public struct GeminiLanguageModel: LanguageModel {
                         content: text as! Content,
                         rawContent: GeneratedContent(text),
                         transcriptEntries: ArraySlice(entries),
+                        usage: usage.value,
                         providerMetadata: providerMetadata
                     )
                 }
@@ -374,6 +379,7 @@ public struct GeminiLanguageModel: LanguageModel {
                     content: content,
                     rawContent: generatedContent,
                     transcriptEntries: ArraySlice(entries),
+                    usage: usage.value,
                     providerMetadata: providerMetadata
                 )
             }
@@ -430,45 +436,58 @@ public struct GeminiLanguageModel: LanguageModel {
 
                     var accumulatedText = ""
                     var accumulatedParts: [GeminiPart] = []
+                    var usage = ReportedUsage()
+
+                    func snapshot() throws -> LanguageModelSession.ResponseStream<Content>.Snapshot? {
+                        var raw: GeneratedContent
+                        let content: Content.PartiallyGenerated?
+
+                        if type == String.self {
+                            raw = GeneratedContent(accumulatedText)
+                            content = (accumulatedText as! Content).asPartiallyGenerated()
+                        } else {
+                            raw =
+                                (try? GeneratedContent(json: accumulatedText))
+                                ?? GeneratedContent(accumulatedText)
+                            if let parsed = try? type.init(raw) {
+                                content = parsed.asPartiallyGenerated()
+                            } else {
+                                // Skip invalid partial JSON until it parses cleanly.
+                                content = nil
+                            }
+                        }
+
+                        guard let content else { return nil }
+                        return .init(
+                            content: content,
+                            rawContent: raw,
+                            usage: usage.value,
+                            providerMetadata: try textPartMetadata(accumulatedParts)
+                        )
+                    }
 
                     for try await chunk in stream {
-                        guard let candidate = chunk.candidates.first else { continue }
+                        let chunkUsage = chunk.usageMetadata?.reportedUsage
+                        usage.merge(chunkUsage)
 
-                        if let parts = candidate.content.parts {
+                        var yieldedText = false
+                        if let parts = chunk.candidates.first?.content.parts {
                             for part in parts {
                                 if case .text(let textPart) = part {
                                     accumulatedText += textPart.text
                                     accumulatedParts.append(part)
 
-                                    var raw: GeneratedContent
-                                    let content: Content.PartiallyGenerated?
-
-                                    if type == String.self {
-                                        raw = GeneratedContent(accumulatedText)
-                                        content = (accumulatedText as! Content).asPartiallyGenerated()
-                                    } else {
-                                        raw =
-                                            (try? GeneratedContent(json: accumulatedText))
-                                            ?? GeneratedContent(accumulatedText)
-                                        if let parsed = try? type.init(raw) {
-                                            content = parsed.asPartiallyGenerated()
-                                        } else {
-                                            // Skip invalid partial JSON until it parses cleanly.
-                                            content = nil
-                                        }
-                                    }
-
-                                    if let content {
-                                        continuation.yield(
-                                            .init(
-                                                content: content,
-                                                rawContent: raw,
-                                                providerMetadata: try textPartMetadata(accumulatedParts)
-                                            )
-                                        )
+                                    if let snapshot = try snapshot() {
+                                        continuation.yield(snapshot)
+                                        yieldedText = true
                                     }
                                 }
                             }
+                        }
+
+                        // A chunk that only reports usage still updates the counts.
+                        if chunkUsage != nil, !yieldedText, let snapshot = try snapshot() {
+                            continuation.yield(snapshot)
                         }
                     }
 
@@ -1092,11 +1111,12 @@ private struct GeminiFunctionResponse: Codable, Sendable {
 }
 
 private struct GeminiGenerateContentResponse: Codable, Sendable {
-    let candidates: [GeminiCandidate]
+    var candidates: [GeminiCandidate] { decodedCandidates ?? [] }
+    private let decodedCandidates: [GeminiCandidate]?
     let usageMetadata: GeminiUsageMetadata?
 
     enum CodingKeys: String, CodingKey {
-        case candidates
+        case decodedCandidates = "candidates"
         case usageMetadata = "usageMetadata"
     }
 }
@@ -1113,12 +1133,34 @@ private struct GeminiCandidate: Codable, Sendable {
 
 private struct GeminiUsageMetadata: Codable, Sendable {
     let promptTokenCount: Int?
+    let toolUsePromptTokenCount: Int?
+    let cachedContentTokenCount: Int?
     let candidatesTokenCount: Int?
     let totalTokenCount: Int?
     let thoughtsTokenCount: Int?
 
+    var reportedUsage: ReportedUsage? {
+        func sum(_ lhs: Int?, _ rhs: Int?) -> Int? {
+            guard lhs != nil || rhs != nil else { return nil }
+            return (lhs ?? 0) + (rhs ?? 0)
+        }
+        // Gemini reports tool-use prompts and reasoning separately from the main counts.
+        return ReportedUsage(
+            input: .init(
+                totalTokenCount: sum(promptTokenCount, toolUsePromptTokenCount),
+                cachedTokenCount: cachedContentTokenCount
+            ),
+            output: .init(
+                totalTokenCount: sum(candidatesTokenCount, thoughtsTokenCount),
+                reasoningTokenCount: thoughtsTokenCount
+            )
+        ).normalized
+    }
+
     enum CodingKeys: String, CodingKey {
         case promptTokenCount
+        case toolUsePromptTokenCount
+        case cachedContentTokenCount
         case candidatesTokenCount
         case totalTokenCount
         case thoughtsTokenCount
