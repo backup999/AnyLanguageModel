@@ -458,6 +458,9 @@ import Foundation
         /// The model's vocabulary
         private var vocab: OpaquePointer?
 
+        /// Vocabulary-derived tokens shared across generations of this loaded model.
+        private var tokenCache: StructuredGenerationTokenCache?
+
         /// The multimodal projector context, when a projector file was provided
         private var mtmdContext: OpaquePointer?
         /// `mtmd_helper_eval_chunks` is not thread-safe and every multimodal generation
@@ -1352,6 +1355,9 @@ import Foundation
             // Initialize backend lazily - must be done before loading model
             llama_backend_init()
 
+            tokenCache = nil
+            vocab = nil
+
             // Free any existing model before loading a new one
             discardCachedSessionContext()
             if let existingContext = mtmdContext {
@@ -1386,6 +1392,7 @@ import Foundation
 
             self.model = loadedModel
             self.vocab = llama_model_get_vocab(loadedModel)
+            self.tokenCache = StructuredGenerationTokenCache()
             self.isModelLoaded = true
         }
 
@@ -1601,7 +1608,7 @@ import Foundation
                 endTokens: [],
                 tokenToTextFn: { [self] token in self.tokenToText(vocab: vocab, token: llama_token(token)) }
             )
-            var generator = try ConstrainedJSONGenerator(backend: backend, schema: schema)
+            var generator = try ConstrainedJSONGenerator(backend: backend, schema: schema, tokenCache: tokenCache)
             let json = try await generator.generate()
             return (
                 json,
