@@ -42,6 +42,84 @@ import Testing
             #expect(await counter.count == 2)
         }
 
+        @Test func concurrentFirstRequestsShareOneFactoryRun() async throws {
+            guard #available(macOS 27.0, iOS 27.0, visionOS 27.0, watchOS 27.0, *) else { return }
+            let counter = Counter()
+            let model = FoundationLanguageModel {
+                await counter.increment()
+                try await Task.sleep(for: .milliseconds(50))
+                return FoundationModels.PrivateCloudComputeLanguageModel()
+            }
+            async let first: Void = model.load()
+            async let second: Void = model.load()
+            async let third: Void = model.load()
+            _ = try await (first, second, third)
+            #expect(await model.isLoaded == true)
+            #expect(await counter.count == 1)
+        }
+
+        @Test func concurrentLoadsPublishStateBeforeReturning() async throws {
+            guard #available(macOS 27.0, iOS 27.0, visionOS 27.0, watchOS 27.0, *) else { return }
+            var incompleteLoads = 0
+            for _ in 0 ..< 200 {
+                let model = FoundationLanguageModel {
+                    try await Task.sleep(for: .milliseconds(1))
+                    return FoundationModels.PrivateCloudComputeLanguageModel()
+                }
+                incompleteLoads += try await withThrowingTaskGroup(of: Int.self) { group in
+                    for _ in 0 ..< 20 {
+                        group.addTask {
+                            try await model.load()
+                            // Check each caller before waiting for the rest of the group.
+                            let isLoaded = await model.isLoaded
+                            let capabilities = await model.capabilities
+                            return isLoaded && capabilities != nil ? 0 : 1
+                        }
+                    }
+                    var failures = 0
+                    for try await value in group { failures += value }
+                    return failures
+                }
+            }
+            #expect(incompleteLoads == 0)
+        }
+
+        @Test func failedFactoryRunIsRetriedOnTheNextRequest() async throws {
+            guard #available(macOS 27.0, iOS 27.0, visionOS 27.0, watchOS 27.0, *) else { return }
+            struct LoadFailure: Error {}
+            let counter = Counter()
+            let model = FoundationLanguageModel {
+                await counter.increment()
+                if await counter.count == 1 {
+                    throw LoadFailure()
+                }
+                return FoundationModels.PrivateCloudComputeLanguageModel()
+            }
+            await #expect(throws: LoadFailure.self) {
+                try await model.load()
+            }
+            #expect(await model.isLoaded == false)
+            try await model.load()
+            #expect(await model.isLoaded == true)
+            #expect(await counter.count == 2)
+        }
+
+        @Test func unloadDuringLoadDiscardsTheResult() async throws {
+            guard #available(macOS 27.0, iOS 27.0, visionOS 27.0, watchOS 27.0, *) else { return }
+            let counter = Counter()
+            let model = FoundationLanguageModel {
+                await counter.increment()
+                try await Task.sleep(for: .milliseconds(50))
+                return FoundationModels.PrivateCloudComputeLanguageModel()
+            }
+            let load = Task { try await model.load() }
+            try await Task.sleep(for: .milliseconds(10))
+            await model.unload()
+            _ = try? await load.value
+            #expect(await model.isLoaded == false)
+            #expect(await counter.count == 1)
+        }
+
         @Test func wrappingAnExistingModelIsLoadedImmediately() async throws {
             guard #available(macOS 27.0, iOS 27.0, visionOS 27.0, watchOS 27.0, *) else { return }
             let model = FoundationLanguageModel(FoundationModels.PrivateCloudComputeLanguageModel())
