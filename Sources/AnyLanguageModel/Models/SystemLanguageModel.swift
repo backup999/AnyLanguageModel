@@ -1,7 +1,6 @@
 #if canImport(FoundationModels)
     import FoundationModels
     import Foundation
-    import PartialJSONDecoder
 
     import JSONSchema
 
@@ -786,9 +785,7 @@
                 return finalize(content: content)
             } catch {
                 // Attempt partial JSON decoding before surfacing an error.
-                let decoder = PartialJSONDecoder()
-                let jsonString = fmResponse.content.jsonString
-                if let partialContent = try? decoder.decode(GeneratedContent.self, from: jsonString).value,
+                if let partialContent = try? GeneratedContent(json: fmResponse.content.jsonString),
                     let content = try? type.init(partialContent)
                 {
                     return finalize(content: content)
@@ -868,7 +865,6 @@
 
                 func processStructuredStream(_ fmSession: FoundationModels.LanguageModelSession) async {
                     let fmSchema = FoundationModels.GenerationSchema(schema)
-                    let partialDecoder = PartialJSONDecoder()
                     let fmStream = fmSession.streamResponse(
                         to: fmPrompt,
                         schema: fmSchema,
@@ -896,12 +892,7 @@
                                     lastLength: &lastLength
                                 )
 
-                                let jsonString = accumulatedText
-                                if let partialContent = try? partialDecoder.decode(
-                                    GeneratedContent.self,
-                                    from: jsonString
-                                )
-                                .value {
+                                if let partialContent = try? GeneratedContent(json: accumulatedText) {
                                     let partial: Content.PartiallyGenerated? = try? .init(partialContent)
                                     if let partial {
                                         continuation.yield(.init(content: partial, rawContent: partialContent))
@@ -935,11 +926,7 @@
                                 ?? GeneratedContent(jsonString)
 
                             // Prefer partial decoding so we can surface intermediate snapshots.
-                            if let partialContent = try? partialDecoder.decode(
-                                GeneratedContent.self,
-                                from: jsonString
-                            )
-                            .value {
+                            if let partialContent = try? GeneratedContent(json: jsonString) {
                                 let partial: Content.PartiallyGenerated? = try? .init(partialContent)
                                 if let partial {
                                     continuation.yield(.init(content: partial, rawContent: partialContent))
