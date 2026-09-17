@@ -858,7 +858,7 @@ private func resolveToolUses(
     var transcriptCalls: [Transcript.ToolCall] = []
     transcriptCalls.reserveCapacity(toolUses.count)
     for use in toolUses {
-        let args = try toGeneratedContent(use.input)
+        let args = GeneratedContent(.object(use.input ?? [:]))
         let callID = use.id
         transcriptCalls.append(
             Transcript.ToolCall(
@@ -953,23 +953,6 @@ private func convertToolToAnthropicFormat(_ tool: any Tool) throws -> AnthropicT
     return AnthropicTool(name: tool.name, description: tool.description, inputSchema: schema)
 }
 
-private func toGeneratedContent(_ value: [String: JSONValue]?) throws -> GeneratedContent {
-    guard let value else { return GeneratedContent(properties: [:]) }
-    let data = try JSONEncoder().encode(JSONValue.object(value))
-    let json = String(data: data, encoding: .utf8) ?? "{}"
-    return try GeneratedContent(json: json)
-}
-
-private func fromGeneratedContent(_ content: GeneratedContent) throws -> [String: JSONValue] {
-    let data = try JSONEncoder().encode(content)
-    let jsonValue = try JSONDecoder().decode(JSONValue.self, from: data)
-
-    guard case .object(let dict) = jsonValue else {
-        return [:]
-    }
-    return dict
-}
-
 // MARK: - Supporting Types
 
 extension Transcript {
@@ -1001,7 +984,7 @@ extension Transcript {
             case .toolCalls(let toolCalls):
                 // Add assistant message with tool use blocks
                 let toolUseBlocks: [AnthropicContent] = toolCalls.map { call in
-                    let input = try? fromGeneratedContent(call.arguments)
+                    let input = call.arguments.jsonValue.objectValue ?? [:]
                     return .toolUse(
                         AnthropicToolUse(
                             id: call.id,

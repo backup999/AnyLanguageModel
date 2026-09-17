@@ -716,7 +716,7 @@ private func resolveFunctionCalls(
     var transcriptCalls: [Transcript.ToolCall] = []
     transcriptCalls.reserveCapacity(functionCalls.count)
     for call in functionCalls {
-        let args = try toGeneratedContent(call.args)
+        let args = GeneratedContent(.object(call.args ?? [:]))
         let callID = UUID().uuidString
         transcriptCalls.append(
             Transcript.ToolCall(
@@ -825,23 +825,6 @@ private func emptyResponseContent<Content: Generable>(
     }
 }
 
-private func toGeneratedContent(_ value: [String: JSONValue]?) throws -> GeneratedContent {
-    guard let value else { return GeneratedContent(properties: [:]) }
-    let data = try JSONEncoder().encode(JSONValue.object(value))
-    let json = String(data: data, encoding: .utf8) ?? "{}"
-    return try GeneratedContent(json: json)
-}
-
-private func fromGeneratedContent(_ content: GeneratedContent) throws -> [String: JSONValue] {
-    let data = Data(content.jsonString.utf8)
-    let jsonValue = try JSONDecoder().decode(JSONValue.self, from: data)
-
-    guard case .object(let dict) = jsonValue else {
-        return [:]
-    }
-    return dict
-}
-
 private func toJSONValue(_ toolOutput: Transcript.ToolOutput) throws -> [String: JSONValue] {
     var result: [String: JSONValue] = [:]
 
@@ -896,7 +879,7 @@ extension Transcript {
             case .toolCalls(let toolCalls):
                 // Add model's response with function calls
                 let functionCallParts: [GeminiPart] = toolCalls.map { call in
-                    let args = try? fromGeneratedContent(call.arguments)
+                    let args = call.arguments.jsonValue.objectValue ?? [:]
                     return .functionCall(
                         GeminiFunctionCall(
                             name: call.toolName,

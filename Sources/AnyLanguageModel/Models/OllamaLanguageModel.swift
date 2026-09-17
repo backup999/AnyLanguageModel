@@ -374,7 +374,7 @@ private func resolveToolCalls(
     var transcriptCalls: [Transcript.ToolCall] = []
     transcriptCalls.reserveCapacity(toolCalls.count)
     for call in toolCalls {
-        let args = try toGeneratedContent(call.function.arguments)
+        let args = GeneratedContent(call.function.arguments ?? .object([:]))
         let callID = call.id ?? UUID().uuidString
         transcriptCalls.append(
             Transcript.ToolCall(
@@ -539,13 +539,6 @@ private func convertToolToOllamaFormat(_ tool: any Tool) throws -> [String: JSON
 
 private func convertSchemaToOllamaFormat(_ schema: GenerationSchema) throws -> JSONSchema {
     try schema.inlinedJSONSchema()
-}
-
-private func toGeneratedContent(_ value: JSONValue?) throws -> GeneratedContent {
-    guard let value else { return GeneratedContent(properties: [:]) }
-    let data = try JSONEncoder().encode(value)
-    let json = String(data: data, encoding: .utf8) ?? "{}"
-    return try GeneratedContent(json: json)
 }
 
 func createChatParams(
