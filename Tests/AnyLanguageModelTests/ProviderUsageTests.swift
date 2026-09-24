@@ -137,6 +137,82 @@ import Testing
                 return result
             }
 
+            func toolStream(includeUsage: Bool = true, city: String = "Paris", callID: String = "call_1") throws
+                -> String
+            {
+                let toolResponse = response(text: "", counts: includeUsage ? counts : nil, tool: true)
+                let events: [[String: Any]]
+                switch self {
+                case .chat:
+                    events =
+                        [
+                            [
+                                "id": "test",
+                                "choices": [
+                                    [
+                                        "delta": [
+                                            "tool_calls": [
+                                                [
+                                                    "index": 0, "id": "call_1", "type": "function",
+                                                    "function": ["name": "getWeather", "arguments": "{\"city\":"],
+                                                ]
+                                            ]
+                                        ]
+                                    ]
+                                ],
+                            ],
+                            [
+                                "id": "test",
+                                "choices": [
+                                    [
+                                        "delta": [
+                                            "tool_calls": [
+                                                [
+                                                    "index": 0, "function": ["arguments": "\"Paris\"}"],
+                                                ]
+                                            ]
+                                        ], "finish_reason": "tool_calls",
+                                    ]
+                                ],
+                            ],
+                        ] + (includeUsage ? [["id": "test", "choices": [], "usage": counts]] : [])
+                case .responses, .openResponses:
+                    events = [["type": "response.completed", "response": toolResponse]]
+                case .anthropic:
+                    events = [
+                        ["type": "message_start", "message": response(text: "", counts: includeUsage ? counts : nil)],
+                        [
+                            "type": "content_block_start", "index": 0,
+                            "content_block": [
+                                "type": "tool_use", "id": "call_1", "name": "getWeather", "input": [:],
+                            ],
+                        ],
+                        [
+                            "type": "content_block_delta", "index": 0,
+                            "delta": [
+                                "type": "input_json_delta", "partial_json": "{\"city\":",
+                            ],
+                        ],
+                        [
+                            "type": "content_block_delta", "index": 0,
+                            "delta": [
+                                "type": "input_json_delta", "partial_json": "\"Paris\"}",
+                            ],
+                        ],
+                        ["type": "content_block_stop", "index": 0],
+                        ["type": "message_stop"],
+                    ]
+                case .gemini, .ollama:
+                    events = [toolResponse]
+                }
+                return try events.map { event in
+                    let json = try ProviderUsageTests.json(event)
+                        .replacingOccurrences(of: "Paris", with: city)
+                        .replacingOccurrences(of: "call_1", with: callID)
+                    return self == .ollama ? json + "\n" : "data: \(json)\n\n"
+                }.joined() + (self == .chat ? "data: [DONE]\n\n" : "")
+            }
+
             func stream(text: String = "Hello", includeUsage: Bool = true) throws -> String {
                 var events: [[String: Any]]
                 switch self {
@@ -236,6 +312,294 @@ import Testing
             #expect(session.usage == provider.expected)
         }
 
+        @Test(arguments: Provider.allCases, [false, true])
+        func streamingToolRound(_ provider: Provider, _ collect: Bool) async throws {
+            UsageURLProtocol.reset()
+            UsageURLProtocol.enqueue(json: try provider.toolStream(includeUsage: false))
+            UsageURLProtocol.enqueue(json: try provider.stream())
+            let tool = RecordingWeatherTool()
+            let session = provider.makeSession(tools: [tool])
+            let stream = session.streamResponse(to: "Weather?")
+            if collect {
+                let response = try await stream.collect()
+                #expect(response.content == "Hello")
+                #expect(response.transcriptEntries.count == 2)
+                #expect(response.usage == provider.expected)
+            } else {
+                var snapshots: [LanguageModelSession.ResponseStream<String>.Snapshot] = []
+                for try await snapshot in stream { snapshots.append(snapshot) }
+                let finalContent: String? = snapshots.last?.content
+                #expect(finalContent == "Hello")
+                #expect(snapshots.last?.transcriptEntries.count == 2)
+                #expect(snapshots.last?.usage == provider.expected)
+            }
+            #expect(UsageURLProtocol.recordedBodies.count == 2)
+            #expect(session.transcript.count == 4)
+            #expect(tool.cities.withLock { $0 } == ["Paris"])
+            let body = try #require(UsageURLProtocol.recordedBodies.last)
+            #expect(String(decoding: body, as: UTF8.self).contains("The weather in Paris is sunny"))
+            #expect(session.usage == provider.expected)
+            #expect(!session.isResponding)
+        }
+
+        private struct RecordingWeatherTool: Tool {
+            let name = "getWeather"
+            let description = "Get the weather"
+            let cities = Locked<[String]>([])
+            var fails = false
+
+            func call(arguments: WeatherTool.Arguments) async throws -> String {
+                cities.withLock { $0.append(arguments.city) }
+                if fails { throw ToolFailure.failed }
+                return try await WeatherTool().call(arguments: arguments)
+            }
+        }
+
+        private enum ToolFailure: Error { case failed }
+
+        private struct OutputDelegate: ToolExecutionDelegate {
+            func toolCallDecision(for toolCall: Transcript.ToolCall, in session: LanguageModelSession) async
+                -> ToolExecutionDecision
+            { .provideOutput([.text(.init(content: "Cached weather"))]) }
+        }
+
+        @Test(arguments: Provider.allCases)
+        func streamedToolRoundsAccumulateUsage(_ provider: Provider) async throws {
+            UsageURLProtocol.reset()
+            UsageURLProtocol.enqueue(json: try provider.toolStream())
+            UsageURLProtocol.enqueue(json: try provider.toolStream(city: "London", callID: "call_2"))
+            UsageURLProtocol.enqueue(json: try provider.stream())
+            let tool = RecordingWeatherTool()
+            let session = provider.makeSession(tools: [tool])
+            var snapshots: [LanguageModelSession.ResponseStream<String>.Snapshot] = []
+            for try await snapshot in session.streamResponse(to: "Weather?") { snapshots.append(snapshot) }
+            let last = try #require(snapshots.last)
+            #expect(last.content == "Hello")
+            var expected = provider.expected
+            expected.add(provider.expected)
+            expected.add(provider.expected)
+            #expect(last.usage == expected)
+            #expect(session.usage == expected)
+            #expect(last.transcriptEntries.count == 4)
+            #expect(session.transcript.count == 6)
+            #expect(tool.cities.withLock { $0 } == ["Paris", "London"])
+            #expect(UsageURLProtocol.recordedBodies.count == 3)
+            for (previous, next) in zip(snapshots, snapshots.dropFirst()) {
+                #expect(next.usage.totalTokenCount >= previous.usage.totalTokenCount)
+                #expect(next.transcriptEntries.count >= previous.transcriptEntries.count)
+            }
+        }
+
+        @Test(arguments: Provider.allCases, [false, true])
+        func streamedToolsThenStructuredContent(_ provider: Provider, _ dynamicSchema: Bool) async throws {
+            UsageURLProtocol.reset()
+            UsageURLProtocol.enqueue(json: try provider.toolStream())
+            UsageURLProtocol.enqueue(json: try provider.stream(text: "{\"answer\":\"Hello\"}"))
+            let session = provider.makeSession(tools: [WeatherTool()])
+            if dynamicSchema {
+                let response = try await session.streamResponse(to: "Weather?", schema: Answer.generationSchema)
+                    .collect()
+                #expect(try response.content.value(String.self, forProperty: "answer") == "Hello")
+                #expect(response.transcriptEntries.count == 2)
+            } else {
+                let response = try await session.streamResponse(to: "Weather?", generating: Answer.self).collect()
+                #expect(response.content.answer == "Hello")
+                #expect(response.transcriptEntries.count == 2)
+            }
+            var expected = provider.expected
+            expected.add(provider.expected)
+            #expect(session.usage == expected)
+            #expect(UsageURLProtocol.recordedBodies.count == 2)
+        }
+
+        @Test(arguments: Provider.allCases)
+        func stoppedStreamedTools(_ provider: Provider) async throws {
+            UsageURLProtocol.reset()
+            UsageURLProtocol.enqueue(json: try provider.toolStream())
+            let tool = RecordingWeatherTool()
+            let session = provider.makeSession(tools: [tool])
+            session.toolExecutionDelegate = StopDelegate()
+            let response = try await session.streamResponse(to: "Weather?").collect()
+            #expect(response.content.isEmpty)
+            #expect(response.transcriptEntries.count == 1)
+            #expect(response.usage == provider.expected)
+            #expect(tool.cities.withLock { $0.isEmpty })
+            #expect(UsageURLProtocol.recordedBodies.count == 1)
+            #expect(!session.isResponding)
+        }
+
+        @Test(arguments: Provider.allCases)
+        func stoppedStreamedToolsWithoutEmptyObjectContent(_ provider: Provider) async throws {
+            UsageURLProtocol.reset()
+            UsageURLProtocol.enqueue(json: try provider.toolStream())
+            let tool = RecordingWeatherTool()
+            let session = provider.makeSession(tools: [tool])
+            session.toolExecutionDelegate = StopDelegate()
+            var snapshots: [LanguageModelSession.ResponseStream<Int>.Snapshot] = []
+            for try await snapshot in session.streamResponse(to: "Weather?", generating: Int.self) {
+                snapshots.append(snapshot)
+            }
+            let last = try #require(snapshots.last)
+            let content: Int = last.content
+            #expect(content == 0)
+            #expect(last.transcriptEntries.count == 1)
+            #expect(last.usage == provider.expected)
+            #expect(session.transcript.count == 3)
+
+            UsageURLProtocol.enqueue(json: try provider.toolStream())
+            let arraySession = provider.makeSession(tools: [tool])
+            arraySession.toolExecutionDelegate = StopDelegate()
+            let response = try await arraySession.streamResponse(to: "Weather?", generating: [String].self).collect()
+            #expect(response.content.isEmpty)
+            #expect(response.transcriptEntries.count == 1)
+            #expect(tool.cities.withLock { $0.isEmpty })
+            #expect(UsageURLProtocol.recordedBodies.count == 2)
+        }
+
+        @Test(arguments: Provider.allCases)
+        func stoppedStreamedToolsWithoutDecodableEmptyContentThrow(_ provider: Provider) async throws {
+            UsageURLProtocol.reset()
+            UsageURLProtocol.enqueue(json: try provider.toolStream())
+            let session = provider.makeSession(tools: [RecordingWeatherTool()])
+            session.toolExecutionDelegate = StopDelegate()
+            var snapshotCount = 0
+            var thrownError: (any Error)?
+            do {
+                for try await _ in session.streamResponse(to: "Weather?", generating: Forecast.self) {
+                    snapshotCount += 1
+                }
+            } catch {
+                thrownError = error
+            }
+            #expect(snapshotCount == 0)
+            #expect(thrownError as? GeneratedContentError == .typeMismatch)
+        }
+
+        @Test func openResponsesToolHistoryUsesTopLevelFunctionCallItems() async throws {
+            let provider = Provider.openResponses
+            UsageURLProtocol.reset()
+            UsageURLProtocol.enqueue(json: try provider.toolStream())
+            UsageURLProtocol.enqueue(json: try provider.stream())
+            UsageURLProtocol.enqueue(json: try provider.stream())
+            let session = provider.makeSession(tools: [WeatherTool()])
+            _ = try await session.streamResponse(to: "Weather?").collect()
+            _ = try await session.streamResponse(to: "And tomorrow?").collect()
+            #expect(UsageURLProtocol.recordedBodies.count == 3)
+
+            let body = try #require(UsageURLProtocol.recordedBodies.last)
+            let json = try #require(JSONSerialization.jsonObject(with: body) as? [String: Any])
+            let input = try #require(json["input"] as? [[String: Any]])
+            let types = input.map { $0["type"] as? String }
+            let callIndex = try #require(types.firstIndex(of: "function_call"))
+            let outputIndex = try #require(types.firstIndex(of: "function_call_output"))
+            #expect(types.filter { $0 == "function_call" }.count == 1)
+            #expect(callIndex < outputIndex)
+            let call = input[callIndex]
+            #expect(call["call_id"] as? String == "call_1")
+            #expect(call["name"] as? String == "getWeather")
+            let arguments = try #require(call["arguments"] as? String)
+            let decodedArguments = try JSONSerialization.jsonObject(with: Data(arguments.utf8)) as? [String: String]
+            #expect(decodedArguments == ["city": "Paris"])
+            #expect(call["id"] == nil)
+            #expect(input[outputIndex]["call_id"] as? String == "call_1")
+            for item in input where item["type"] as? String == "message" {
+                let content = item["content"] as? [[String: Any]] ?? []
+                #expect(!content.contains { $0["type"] as? String == "function_call" })
+            }
+        }
+
+        @Test(arguments: Provider.allCases)
+        func streamedToolOutputOverride(_ provider: Provider) async throws {
+            UsageURLProtocol.reset()
+            UsageURLProtocol.enqueue(json: try provider.toolStream())
+            UsageURLProtocol.enqueue(json: try provider.stream())
+            let tool = RecordingWeatherTool()
+            let session = provider.makeSession(tools: [tool])
+            session.toolExecutionDelegate = OutputDelegate()
+            let response = try await session.streamResponse(to: "Weather?").collect()
+            #expect(response.content == "Hello")
+            #expect(tool.cities.withLock { $0.isEmpty })
+            let body = try #require(UsageURLProtocol.recordedBodies.last)
+            #expect(String(decoding: body, as: UTF8.self).contains("Cached weather"))
+            #expect(UsageURLProtocol.recordedBodies.count == 2)
+        }
+
+        @Test(arguments: Provider.allCases)
+        func streamedToolFailure(_ provider: Provider) async throws {
+            UsageURLProtocol.reset()
+            UsageURLProtocol.enqueue(json: try provider.toolStream())
+            let tool = RecordingWeatherTool(fails: true)
+            let session = provider.makeSession(tools: [tool])
+            do {
+                _ = try await session.streamResponse(to: "Weather?").collect()
+                Issue.record("Expected the tool error")
+            } catch let error as LanguageModelSession.ToolCallError {
+                #expect(error.underlyingError is ToolFailure)
+            }
+            #expect(tool.cities.withLock { $0 } == ["Paris"])
+            #expect(UsageURLProtocol.recordedBodies.count == 1)
+            #expect(!session.isResponding)
+        }
+
+        @Test(arguments: [Provider.chat, .anthropic])
+        func interleavedStreamedToolArguments(_ provider: Provider) async throws {
+            UsageURLProtocol.reset()
+            let first = try provider.toolStream(includeUsage: false).components(separatedBy: "\n\n")
+                .filter { !$0.isEmpty && !$0.contains("[DONE]") }
+            let second = try provider.toolStream(includeUsage: false, city: "London", callID: "call_2")
+                .replacingOccurrences(of: "\"index\":0", with: "\"index\":1")
+                .components(separatedBy: "\n\n")
+                .filter { !$0.isEmpty && !$0.contains("[DONE]") }
+            let events = zip(first, second).flatMap { [$0, $1] }.filter {
+                !$0.contains("message_stop") && !$0.contains("message_start")
+            }
+            let end = provider == .chat ? "data: [DONE]\n\n" : "data: {\"type\":\"message_stop\"}\n\n"
+            UsageURLProtocol.enqueue(json: events.joined(separator: "\n\n") + "\n\n" + end)
+            UsageURLProtocol.enqueue(json: try provider.stream())
+            let tool = RecordingWeatherTool()
+            let response = try await provider.makeSession(tools: [tool]).streamResponse(to: "Weather?").collect()
+            #expect(response.content == "Hello")
+            #expect(tool.cities.withLock { $0 } == ["Paris", "London"])
+            #expect(response.transcriptEntries.count == 3)
+            let body = try #require(UsageURLProtocol.recordedBodies.last)
+            let json = String(decoding: body, as: UTF8.self)
+            #expect(json.contains("call_1"))
+            #expect(json.contains("call_2"))
+            #expect(json.contains("The weather in Paris is sunny"))
+            #expect(json.contains("The weather in London is sunny"))
+        }
+
+        private struct CancellableWeatherTool: Tool {
+            let name = "getWeather"
+            let description = "Get the weather"
+            let started: AsyncStream<Void>.Continuation
+            let finished: AsyncStream<Void>.Continuation
+
+            func call(arguments: WeatherTool.Arguments) async throws -> String {
+                started.yield(())
+                defer { finished.yield(()) }
+                try await Task.sleep(for: .seconds(60))
+                return "Unexpected result"
+            }
+        }
+
+        @Test(arguments: Provider.allCases)
+        func cancelledToolStreamDoesNotRequestNextRound(_ provider: Provider) async throws {
+            UsageURLProtocol.reset()
+            UsageURLProtocol.enqueue(json: try provider.toolStream())
+            let (started, startContinuation) = AsyncStream<Void>.makeStream()
+            let (finished, finishContinuation) = AsyncStream<Void>.makeStream()
+            let session = provider.makeSession(tools: [
+                CancellableWeatherTool(started: startContinuation, finished: finishContinuation)
+            ])
+            let consumer = Task { try await session.streamResponse(to: "Weather?").collect() }
+            for await _ in started { break }
+            consumer.cancel()
+            _ = await consumer.result
+            for await _ in finished { break }
+            #expect(UsageURLProtocol.recordedBodies.count == 1)
+        }
+
         @Test func customChatEndpointOmitsStreamOptions() async throws {
             UsageURLProtocol.reset()
             UsageURLProtocol.enqueue(json: try Provider.chat.stream(includeUsage: false))
@@ -301,6 +665,12 @@ import Testing
 
         @Generable
         struct Answer { var answer: String }
+
+        @Generable
+        enum Sky { case clear, cloudy }
+
+        @Generable
+        struct Forecast { var sky: Sky }
 
         @Test(arguments: Provider.allCases)
         func structuredResponsesPreserveUsage(_ provider: Provider) async throws {
